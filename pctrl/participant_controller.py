@@ -4,12 +4,12 @@
 
 
 import argparse
-#import atexit
+import atexit
 import json
-from multiprocessing.connection import Listener
+from multiprocessing.connection import Listener, Client
 import os
-#from signal import signal, SIGTERM
-#from sys import exit
+from signal import signal, SIGTERM
+from sys import exit
 from threading import RLock, Thread
 import time
 
@@ -75,17 +75,20 @@ class ParticipantController(object):
         self.dp_queued = []
 
 
-    def start(self):
+    def xstart(self):
         # Start all clients/listeners/whatevs
         self.logger.info("Starting controller for participant")
 
         # ExaBGP Peering Instance
         self.bgp_instance = self.cfg.get_bgp_instance()
-        self.logger.debug("Trace: Started controller for participant")
 
         # Route server client, Reference monitor client, Arp Proxy client
         self.xrs_client = self.cfg.get_xrs_client(self.logger)
+	self.xrs_client.send({'msgType': 'hello', 'id': self.cfg.id, 'peers_in': self.cfg.peers_in, 'peers_out': self.cfg.peers_out, 'ports': self.cfg.get_ports()})
+
         self.arp_client = self.cfg.get_arp_client(self.logger)
+        self.arp_client.send({'msgType': 'hello', 'macs': self.cfg.get_macs()})
+
         self.refmon_client = self.cfg.get_refmon_client(self.logger)
          # class for building flow mod msgs to the reference monitor
         self.fm_builder = FlowModMsgBuilder(self.id, self.refmon_client.key)
@@ -94,13 +97,18 @@ class ParticipantController(object):
         self.initialize_dataplane()
         self.push_dp()
 
-        # Start the event handler
-        eh_socket = self.cfg.get_eh_info()
-        self.listener_eh = Listener(eh_socket, authkey=None)
-        self.start_eh()
-        #ps_thread = Thread(target=self.start_eh)
-        #ps_thread.daemon = True
-        #ps_thread.start()
+        # Start the event handlers
+        ps_thread_arp = Thread(target=self.start_eh_arp)
+        ps_thread_arp.daemon = True
+        ps_thread_arp.start()
+
+        ps_thread_xrs = Thread(target=self.start_eh_xrs)
+        ps_thread_xrs.daemon = True
+        ps_thread_xrs.start()
+
+        ps_thread_arp.join()
+        ps_thread_xrs.join()
+        self.logger.debug("Return from ps_thread.join()")
 
 
     def load_policies(self, policy_file):
@@ -170,49 +178,62 @@ class ParticipantController(object):
 
     def stop(self):
         "Stop the Participants' SDN Controller"
-        self.logger.info("Stopping Controller. "+str(self.logger_info))
+
+        self.logger.info("Stopping Controller.")
 
         # Signal Termination and close blocking listener
         self.run = False
-        conn = Client(self.cfg.get_eh_info(), authkey=None)
-        conn.send("terminate")
-        conn.close()
 
         # TODO: confirm that this isn't silly
-        self.xrs_client = None
-        self.refmon_client = None
-        self.arp_client = None
-
-        # TODO: Think of better way of terminating this listener
-        self.listener_eh.close()
+        #self.refmon_client = None
 
 
-    def start_eh(self):
-        '''Socket listener for network events '''
-        self.logger.info("Event Handler started.")
+    def start_eh_arp(self):
+        self.logger.info("ARP Event Handler started.")
 
         while self.run:
-            self.logger.debug("EH waiting for connection...")
-            conn_eh = self.listener_eh.accept()
+            # need to poll since recv() will not detect close from this end
+            # and need some way to shutdown gracefully.
+            if not self.arp_client.poll(1):
+                continue
+            try:
+                tmp = self.arp_client.recv()
+            except EOFError:
+                break
 
-            tmp = conn_eh.recv()
+            data = json.loads(tmp)
+            self.logger.debug("ARP Event received: %s", data)
 
-            if tmp != "terminate":
-                self.logger.debug("EH established connection...")
+            # Starting a thread for independently processing each incoming network event
+            event_processor_thread = Thread(target=self.process_event, args=(data,))
+            event_processor_thread.daemon = True
+            event_processor_thread.start()
 
-                data = json.loads(tmp)
+        self.arp_client.close()
+        self.logger.debug("Exiting start_eh_arp")
 
-                self.logger.debug("Event received of type "+str(data.keys()))
 
-                # Starting a thread for independently processing each incoming network event
-                event_processor_thread = Thread(target = self.process_event, args = [data])
-                event_processor_thread.daemon = True
-                event_processor_thread.start()
+    def start_eh_xrs(self):
+        self.logger.info("XRS Event Handler started.")
 
-                # Send a message back to the sender.
-                reply = "Event Received"
-                conn_eh.send(reply)
-            conn_eh.close()
+        while self.run:
+            # need to poll since recv() will not detect close from this end
+            # and need some way to shutdown gracefully.
+            if not self.xrs_client.poll(1):
+                continue
+            try:
+                tmp = self.xrs_client.recv()
+            except EOFError:
+                break
+
+            data = json.loads(tmp)
+            self.logger.debug("XRS Event received: %s", data)
+
+            self.process_event(data)
+
+        self.xrs_client.close()
+        self.logger.debug("Exiting start_eh_xrs")
+
 
     def process_event(self, data):
         "Locally process each incoming network event"
@@ -324,7 +345,9 @@ class ParticipantController(object):
             self.logger.debug("Sending ARP Response: "+str(arp_responses))
 
         for arp_response in arp_responses:
-            self.arp_client.send(json.dumps(arp_response))
+            arp_response['msgType'] = 'garp'
+            self.arp_client.send(arp_response)
+
 
     def getlock(self, prefixes):
         prefixes.sort()
@@ -340,111 +363,105 @@ class ParticipantController(object):
         "Process each incoming BGP advertisement"
         tstart = time.time()
 
-        prefixes = get_prefixes_from_announcements(route)
-        with self.getlock(prefixes):
-            reply = ''
-            # Map to update for each prefix in the route advertisement.
-            updates = self.bgp_instance.update(route)
-            #self.logger.debug("process_bgp_route:: "+str(updates))
-            # TODO: This step should be parallelized
-            # TODO: The decision process for these prefixes is going to be same, we
-            # should think about getting rid of such redundant computations.
-            for update in updates:
-                self.bgp_instance.decision_process_local(update)
-                self.vnh_assignment(update)
+        # Map to update for each prefix in the route advertisement.
+        updates = self.bgp_instance.update(route)
+        #self.logger.debug("process_bgp_route:: "+str(updates))
+        # TODO: This step should be parallelized
+        # TODO: The decision process for these prefixes is going to be same, we
+        # should think about getting rid of such redundant computations.
+        for update in updates:
+            self.bgp_instance.decision_process_local(update)
+            self.vnh_assignment(update)
 
-            if TIMING:
-                elapsed = time.time() - tstart
-                self.logger.debug("Time taken for decision process: "+str(elapsed))
-                tstart = time.time()
+        if TIMING:
+            elapsed = time.time() - tstart
+            self.logger.debug("Time taken for decision process: "+str(elapsed))
+            tstart = time.time()
 
-            if self.cfg.isSupersetsMode():
+        if self.cfg.isSupersetsMode():
             ################## SUPERSET RESPONSE TO BGP ##################
-                # update supersets
-                "Map the set of BGP updates to a list of superset expansions."
-                ss_changes, ss_changed_prefs = self.supersets.update_supersets(self, updates)
-
-                if TIMING:
-                    elapsed = time.time() - tstart
-                    self.logger.debug("Time taken to update supersets: "+str(elapsed))
-                    tstart = time.time()
-
-                # ss_changed_prefs are prefixes for which the VMAC bits have changed
-                # these prefixes must have gratuitous arps sent
-                garp_required_vnhs = [self.prefix_2_VNH[prefix] for prefix in ss_changed_prefs]
-
-                "If a recomputation event was needed, wipe out the flow rules."
-                if ss_changes["type"] == "new":
-                    self.logger.debug("Wiping outbound rules.")
-                    wipe_msgs = msg_clear_all_outbound(self.policies, self.port0_mac)
-                    self.dp_queued.extend(wipe_msgs)
-
-                    #if a recomputation was needed, all VMACs must be reARPed
-                    # TODO: confirm reARPed is a word
-                    garp_required_vnhs = self.VNH_2_prefix.keys()
-
-                if len(ss_changes['changes']) > 0:
-
-                    self.logger.debug("Supersets have changed: "+str(ss_changes))
-
-                    "Map the superset changes to a list of new flow rules."
-                    flow_msgs = update_outbound_rules(ss_changes, self.policies,
-                            self.supersets, self.port0_mac)
-
-                    self.logger.debug("Flow msgs: "+str(flow_msgs))
-                    "Dump the new rules into the dataplane queue."
-                    self.dp_queued.extend(flow_msgs)
-
-                if TIMING:
-                    elapsed = time.time() - tstart
-                    self.logger.debug("Time taken to deal with ss_changes: "+str(elapsed))
-                    tstart = time.time()
-
-            ################## END SUPERSET RESPONSE ##################
-
-            else:
-                # TODO: similar logic for MDS
-                self.logger.debug("Creating ctrlr messages for MDS scheme")
-
-            self.push_dp()
+            # update supersets
+            "Map the set of BGP updates to a list of superset expansions."
+            ss_changes, ss_changed_prefs = self.supersets.update_supersets(self, updates)
 
             if TIMING:
                 elapsed = time.time() - tstart
-                self.logger.debug("Time taken to push dp msgs: "+str(elapsed))
+                self.logger.debug("Time taken to update supersets: "+str(elapsed))
                 tstart = time.time()
 
-            changed_vnhs, announcements = self.bgp_instance.bgp_update_peers(updates,
-                    self.prefix_2_VNH, self.cfg.ports)
+            # ss_changed_prefs are prefixes for which the VMAC bits have changed
+            # these prefixes must have gratuitous arps sent
+            garp_required_vnhs = [self.prefix_2_VNH[prefix] for prefix in ss_changed_prefs]
 
-            """ Combine the VNHs which have changed BGP default routes with the
-                VNHs which have changed supersets.
-            """
+            "If a recomputation event was needed, wipe out the flow rules."
+            if ss_changes["type"] == "new":
+                self.logger.debug("Wiping outbound rules.")
+                wipe_msgs = msg_clear_all_outbound(self.policies, self.port0_mac)
+                self.dp_queued.extend(wipe_msgs)
 
-            changed_vnhs = set(changed_vnhs)
-            changed_vnhs.update(garp_required_vnhs)
+                #if a recomputation was needed, all VMACs must be reARPed
+                # TODO: confirm reARPed is a word
+                garp_required_vnhs = self.VNH_2_prefix.keys()
 
-            # Send gratuitous ARP responses for all them
-            for vnh in changed_vnhs:
-                self.process_arp_request(None, vnh)
+            if len(ss_changes['changes']) > 0:
 
-            # Tell Route Server that it needs to announce these routes
-            for announcement in announcements:
-                # TODO: Complete the logic for this function
-                self.send_announcement(announcement)
+                self.logger.debug("Supersets have changed: "+str(ss_changes))
+
+                "Map the superset changes to a list of new flow rules."
+                flow_msgs = update_outbound_rules(ss_changes, self.policies,
+                        self.supersets, self.port0_mac)
+
+                self.logger.debug("Flow msgs: "+str(flow_msgs))
+                "Dump the new rules into the dataplane queue."
+                self.dp_queued.extend(flow_msgs)
 
             if TIMING:
                 elapsed = time.time() - tstart
-                self.logger.debug("Time taken to send garps/announcements: "+str(elapsed))
+                self.logger.debug("Time taken to deal with ss_changes: "+str(elapsed))
                 tstart = time.time()
 
-            return reply
+        ################## END SUPERSET RESPONSE ##################
+
+        else:
+            # TODO: similar logic for MDS
+            self.logger.debug("Creating ctrlr messages for MDS scheme")
+
+        self.push_dp()
+
+        if TIMING:
+            elapsed = time.time() - tstart
+            self.logger.debug("Time taken to push dp msgs: "+str(elapsed))
+            tstart = time.time()
+
+        changed_vnhs, announcements = self.bgp_instance.bgp_update_peers(updates,
+                self.prefix_2_VNH, self.cfg.ports)
+
+        """ Combine the VNHs which have changed BGP default routes with the
+            VNHs which have changed supersets.
+        """
+
+        changed_vnhs = set(changed_vnhs)
+        changed_vnhs.update(garp_required_vnhs)
+
+        # Send gratuitous ARP responses for all them
+        for vnh in changed_vnhs:
+            self.process_arp_request(None, vnh)
+
+        # Tell Route Server that it needs to announce these routes
+        for announcement in announcements:
+            # TODO: Complete the logic for this function
+            self.send_announcement(announcement)
+
+        if TIMING:
+            elapsed = time.time() - tstart
+            self.logger.debug("Time taken to send garps/announcements: "+str(elapsed))
+            tstart = time.time()
 
 
     def send_announcement(self, announcement):
         "Send the announcements to XRS"
-        self.logger.debug("Sending announcements to XRS. "+str(type(announcement)))
-
-        self.xrs_client.send(json.dumps(announcement))
+	self.logger.debug("Sending announcements to XRS: %s", announcement)
+	self.xrs_client.send({'msgType': 'bgp', 'announcement': announcement})
 
 
     def vnh_assignment(self, update):
@@ -540,18 +557,20 @@ def main():
 
     # start controller
     ctrlr = ParticipantController(args.id, config_file, policy_file, logger)
-    ctrlr_thread = Thread(target=ctrlr.start)
+    ctrlr_thread = Thread(target=ctrlr.xstart)
     ctrlr_thread.daemon = True
     ctrlr_thread.start()
 
-    #atexit.register(ctrlr.stop)
-    #signal(SIGTERM, lambda signum, stack_frame: exit(1))
+    atexit.register(ctrlr.stop)
+    signal(SIGTERM, lambda signum, stack_frame: exit(1))
 
     while ctrlr_thread.is_alive():
         try:
             ctrlr_thread.join(1)
         except KeyboardInterrupt:
             ctrlr.stop()
+
+    logger.info("Pctrl exiting")
 
 
 if __name__ == '__main__':
